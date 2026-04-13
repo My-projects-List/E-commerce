@@ -13,7 +13,9 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Recommendation engine using Redis sorted sets.
- * Algorithm: collaborative filtering via user-interaction scoring.
+ * Current algorithm: weighted implicit-feedback scoring per user.
+ * This is not full collaborative filtering yet because there is no
+ * user-user similarity, item-item similarity, or matrix factorisation.
  * Cold-start fallback: global popularity sorted set.
  */
 @Slf4j

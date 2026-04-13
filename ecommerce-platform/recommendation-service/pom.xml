@@ -12,7 +12,7 @@
 
     <artifactId>recommendation-service</artifactId>
     <name>Recommendation Service</name>
-    <description>Collaborative-filtering recommendations backed by Redis, updated via Kafka activity events</description>
+    <description>Redis-backed implicit-feedback recommendations using weighted user activity events</description>
 
     <dependencies>
         <dependency>

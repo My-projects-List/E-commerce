@@ -1,6 +1,7 @@
 import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
+  output: 'standalone', // required for Docker multi-stage build
   images: {
     remotePatterns: [
       { protocol: 'https', hostname: '**.amazonaws.com' },

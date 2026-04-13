@@ -91,7 +91,8 @@ public class CartServiceImpl implements CartService {
         cart.setUpdatedAt(LocalDateTime.now());
         saveCart(cart);
 
-        // Publish activity event for recommendation engine
+        // Publish activity event so recommendation-service can update
+        // weighted Redis scores for this user's product interactions.
         kafkaTemplate.send(KafkaTopics.USER_ACTIVITY, UserActivityEvent.builder()
                 .eventId(UUID.randomUUID().toString())
                 .userId(userId)

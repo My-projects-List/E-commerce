@@ -1,6 +1,8 @@
-# GitHub Copilot Instructions — Java E-Commerce Microservices Platform
+# GitHub Copilot Instructions — Full-Stack E-Commerce Platform
 
-> **Stack:** Java 17 · Spring Boot 3.2.3 · Spring Cloud 2023.0.0 · Maven multi-module  
+> **Backend:** Java 17 · Spring Boot 3.2.3 · Spring Cloud 2023.0.0 · Maven multi-module  
+> **Web frontend:** Next.js 14 (App Router) · TypeScript · Tailwind CSS · shadcn/ui  
+> **Mobile:** React Native (Expo SDK 51) · TypeScript · Expo Router  
 > **Last updated:** 2026-04-12  
 > **Root POM:** `pom.xml` · **Compose:** `docker-compose.yml`
 
@@ -69,7 +71,7 @@ The platform is an **event-driven microservices architecture** composed of 11 Sp
 |---|---|
 | Separate DB per service | Prevents schema coupling; each service owns its data |
 | Kafka for order/payment | At-least-once delivery; manual ACK prevents data loss |
-| Redis for cart (no DB) | Cart is ephemeral; Redis sorted sets for recommendations |
+| Redis for cart (no DB) | Cart is ephemeral; recommendation-service also uses Redis sorted sets for weighted user activity scoring |
 | Feign for admin reports | Admin aggregates data from multiple services synchronously |
 | Gateway-level JWT validation | Services trust `X-User-Id` header — no repeated JWT parsing |
 
@@ -148,12 +150,43 @@ KafkaTopics.INVENTORY_LOW_STOCK    = "inventory.low_stock"
 ### Redis Key Schema
 
 ```
-refresh_token:{userId}          → JWT string        TTL: 7 days    (user-service)
-product:{productId}             → ProductDto JSON   TTL: 5 min     (product-service)
-category:{categoryId}           → CategoryDto JSON  TTL: 1 hour    (product-service)
-cart:{userId}                   → Cart JSON         TTL: session   (cart-service)
-recommendations:{userId}        → List<productId>   TTL: varies    (recommendation-service)
-rate_limit:{userId or IP}       → token bucket      TTL: rolling   (api-gateway via Redis)
+refresh_token:{userId}          -> JWT string        TTL: 7 days    (user-service)
+product:{productId}             -> ProductDto JSON   TTL: 5 min     (product-service)
+category:{categoryId}           -> CategoryDto JSON  TTL: 1 hour    (product-service)
+cart:{userId}                   -> Cart JSON         TTL: session    (cart-service)
+rec:global:popular              -> ZSET<productId>   TTL: none       (recommendation-service)
+rec:user:{userId}               -> ZSET<productId>   TTL: 90 days    (recommendation-service)
+rec:coview:{productId}          -> ZSET<productId>   TTL: varies     (recommendation-service, reserved for also-viewed)
+rate_limit:{userId or IP}       -> token bucket      TTL: rolling    (api-gateway via Redis)
+```
+
+### Recommendation Service - Current Behavior
+
+ASCII-only summary of the implemented recommendation logic:
+
+```
+Input event: UserActivityEvent { userId, productId, activityType }
+
+Weights:
+- PRODUCT_VIEW     -> 1.0
+- WISHLIST_ADD     -> 2.0
+- CART_ADD         -> 3.0
+- REVIEW_SUBMITTED -> 5.0
+- PURCHASE         -> 10.0
+
+Writes on each event:
+- rec:global:popular           += weight for productId
+- rec:user:{userId}            += weight for productId
+
+Read path for GET /api/recommendations:
+- if user has fewer than 3 scored products, return rec:global:popular
+- else return top products from rec:user:{userId}
+- if fewer than requested limit, fill remaining slots from rec:global:popular
+
+Important note:
+- This is not full collaborative filtering yet.
+- It is an implicit-feedback scoring model based on one user's own interactions.
+- There is no similar-user lookup or user-user matrix in the current code.
 ```
 
 ### Database Schemas
@@ -346,22 +379,34 @@ payments       : payment_id(PK), order_id, user_id, amount, currency(default USD
     │ USER_ACTIVITY ────────────────►│                             │
     │ topic: user.activity          │ Kafka consumer              │
     │ {userId, productId, action}   │                             │
-    │                               │ Collaborative filtering     │
-    │                               │ ZADD user:views:{userId}    │
-    │                               │       score=timestamp       │
-    │                               │       member=productId ─────►│
+    │                               │ scoreWeight(activityType)   │
+    │                               │ ZINCRBY rec:global:popular  │
+    │                               │         weight productId ───►│
+    │                               │ ZINCRBY rec:user:{userId}   │
+    │                               │         weight productId ───►│
+    │                               │ EXPIRE rec:user:{userId}    │
+    │                               │         90 days             │
     │                               │                             │
     │                    GET /api/recommendations                  │
     │                    X-User-Id: {userId}                       │
-    │                               │ ZREVRANGE                   │
-    │                               │ recommendations:{userId} ───►│
+    │                               │ if profile size < 3         │
+    │                               │   use rec:global:popular    │
+    │                               │ else ZREVRANGE              │
+    │                               │   rec:user:{userId} ────────►│
     │                               │◄── List<productId> ─────────┤
+    │                               │ pad from rec:global:popular │
     │                               │                             │
     │                    GET /api/recommendations/also-viewed/{productId}
     │                               │ ZREVRANGE                   │
-    │                               │ also_viewed:{productId} ────►│
+    │                               │ rec:coview:{productId} ─────►│
     │                               │◄── List<productId> ─────────┤
+    │                               │ fallback -> global popular  │
 ```
+
+Notes:
+- The current implementation is a weighted per-user ranking model, not full collaborative filtering.
+- `rec:coview:{productId}` is read by the API but is not populated anywhere yet.
+- The Kafka consumer class exists, but event-consumption wiring is still incomplete.
 
 ### F. Admin Report Aggregation Flow
 
@@ -872,5 +917,250 @@ Init containers: Wait for postgres ready before user/product/order/payment servi
 ```
 
 ---
+
+---
+
+## 11. Full-Stack Frontend Architecture
+
+### Repository Layout
+
+```
+ecommerce-platform/
+├── shared/types/index.ts         ← Single source of truth for all TypeScript types
+│                                   (mirrors Java DTOs from common/ module)
+├── frontend/                     ← Next.js 14 web app (port 3000)
+│   ├── app/
+│   │   ├── (store)/              ← Customer storefront route group
+│   │   │   ├── page.tsx          ← Home: hero, categories, featured products
+│   │   │   ├── products/
+│   │   │   │   ├── page.tsx      ← Catalog: filter panel + paginated grid
+│   │   │   │   └── [id]/page.tsx ← Product detail: images, reviews, add-to-cart
+│   │   │   ├── cart/page.tsx     ← Full cart view (CartSidebar is the drawer)
+│   │   │   ├── checkout/page.tsx ← 3-step: address → payment → review
+│   │   │   ├── orders/
+│   │   │   │   ├── page.tsx      ← Order history list
+│   │   │   │   └── [id]/page.tsx ← Order detail + progress tracker (polls every 30s)
+│   │   │   └── profile/page.tsx  ← Tabbed: profile / addresses / wishlist
+│   │   ├── (admin)/admin/        ← Admin dashboard route group (ADMIN role only)
+│   │   │   ├── layout.tsx        ← Sidebar layout with role guard
+│   │   │   ├── page.tsx          ← Dashboard: stat cards + Recharts charts
+│   │   │   ├── products/page.tsx ← Product table + discount modal
+│   │   │   ├── orders/page.tsx   ← Orders table + status filter tabs
+│   │   │   └── reports/page.tsx  ← Date-range reports + revenue chart
+│   │   ├── auth/
+│   │   │   ├── login/page.tsx    ← Email/password login → JWT → Zustand
+│   │   │   └── register/page.tsx ← Registration + password strength meter
+│   │   ├── layout.tsx            ← Root layout: Providers (React Query + ThemeProvider)
+│   │   └── globals.css           ← CSS custom properties (shadcn/ui design tokens)
+│   ├── components/
+│   │   ├── providers.tsx         ← React Query + next-themes wrappers
+│   │   └── store/
+│   │       ├── Navbar.tsx        ← Sticky nav: search, cart badge, user dropdown
+│   │       ├── CartSidebar.tsx   ← Slide-over cart drawer (opens from any page)
+│   │       ├── ProductCard.tsx   ← Card with optimistic add-to-cart, wishlist toggle
+│   │       └── FeaturedProducts.tsx
+│   ├── lib/
+│   │   ├── api.ts                ← Axios client; auto-refresh on 401; all API methods
+│   │   ├── store.ts              ← Zustand: useAuthStore, useCartStore, useUIStore
+│   │   └── utils.ts             ← cn(), formatCurrency(), formatDate(), etc.
+│   ├── middleware.ts             ← Next.js middleware: JWT cookie → redirect on :401
+│   ├── Dockerfile               ← Multi-stage: deps → builder → runner (standalone)
+│   └── next.config.ts           ← output: 'standalone', /api/* rewrite → gateway
+│
+└── mobile/                       ← React Native Expo app (iOS + Android)
+    ├── app/
+    │   ├── _layout.tsx           ← Root: QueryClient + GestureHandler + Toast
+    │   ├── (tabs)/
+    │   │   ├── _layout.tsx       ← Bottom tabs: Home / Search / Cart / Profile
+    │   │   ├── index.tsx         ← Home: hero banner, category pills, top-rated grid
+    │   │   ├── search.tsx        ← Search bar → productApi.search → FlashList grid
+    │   │   ├── cart.tsx          ← Cart list, qty controls, checkout CTA
+    │   │   └── profile.tsx       ← Auth gate → profile, orders link, logout
+    │   ├── product/[id].tsx      ← Image carousel, specs, reviews, sticky add-to-cart
+    │   ├── auth/
+    │   │   ├── login.tsx         ← Email/pw form → AsyncStorage tokens
+    │   │   └── register.tsx      ← Registration + pw strength bars
+    │   ├── checkout.tsx          ← 3-step checkout (address → payment → review)
+    │   └── orders/
+    │       ├── index.tsx         ← Order list
+    │       └── [id].tsx          ← Order detail + progress dots, cancel button
+    ├── lib/
+    │   ├── api.ts                ← Mirrors frontend/lib/api.ts; uses AsyncStorage
+    │   └── store.ts              ← Zustand: useAuthStore, useCartStore
+    ├── app.json                  ← Expo config: bundleId, icons, EAS project ID
+    └── babel.config.js           ← expo, reanimated, module-resolver plugins
+```
+
+### Key Frontend Patterns
+
+**Shared types — single source of truth**
+```typescript
+// shared/types/index.ts — import in both frontend and mobile:
+import type { Product, Cart, Order } from '../../shared/types';
+// Never duplicate type definitions between web and mobile.
+```
+
+**API client pattern (identical shape in web + mobile)**
+```typescript
+// All methods return the unwrapped T from ApiResponse<T>
+// frontend/lib/api.ts — browser (localStorage tokens)
+// mobile/lib/api.ts   — React Native (AsyncStorage tokens)
+const products = await productApi.list({ categoryId: 'electronics', page: 0 });
+const cart     = await cartApi.addItem({ productId: id, quantity: 1 });
+```
+
+**Auth flow (web)**
+```
+Login → authApi.login() → tokens → useAuthStore.setAuth()
+                                  → tokenStorage.setTokens() (localStorage)
+                                  → router.push('/') or '/admin'
+Protected page → middleware.ts reads cookie → redirect if missing
+Expired token  → axios interceptor auto-calls /api/users/refresh-token
+```
+
+**Auth flow (mobile)**
+```
+Login → authApi.login() → tokens → useAuthStore.setAuth()
+                                  → tokenStorage.setTokens() (AsyncStorage)
+                                  → router.replace('/(tabs)/index')
+```
+
+**React Query key conventions**
+```typescript
+['products', filters]         // product list — invalidated on filter change
+['product', productId]        // single product detail
+['cart']                      // user's cart — invalidated after add/remove/update
+['orders']                    // order list
+['order', orderId]            // single order — refetchInterval: 30_000
+['admin', 'dashboard']        // admin stats — refetchInterval: 300_000
+['profile']                   // user profile
+['wishlist']                  // wishlist product IDs
+```
+
+**Zustand stores**
+```typescript
+useAuthStore  → { user, tokens, isAuthenticated, isAdmin, setAuth, logout }
+useCartStore  → { cart, isOpen, setCart, openCart, closeCart }
+useUIStore    → { searchQuery, setSearchQuery }
+```
+
+**Admin route guard (two layers)**
+1. `middleware.ts` — decodes JWT cookie, redirects non-ADMIN away from `/admin/*`
+2. `(admin)/admin/layout.tsx` — `useAuthStore().isAdmin` check → renders "Access Denied"
+
+### Frontend → Backend Data Flow
+
+```
+  Browser / Expo app
+       │
+       │  All requests to /api/* (web: via Next.js rewrite, mobile: direct)
+       ▼
+  API Gateway :8080  ──── JWT validated ──── X-User-Id injected
+       │
+       ├── /api/users/**        → user-service     :8081
+       ├── /api/products/**     → product-service  :8082  (circuit breaker)
+       ├── /api/cart/**         → cart-service     :8083
+       ├── /api/orders/**       → order-service    :8084
+       ├── /api/checkout/**     → order-service    :8084
+       ├── /api/payments/**     → payment-service  :8085
+       ├── /api/search/**       → search-service   :8087
+       ├── /api/recommendations/**→recommendation-service :8088
+       └── /api/admin/**        → admin-service    :8089
+```
+
+### Port Reference (Complete — all layers)
+
+```
+Next.js frontend   : 3000   (http://localhost:3000)
+Spring API Gateway : 8080   (http://localhost:8080)
+Eureka dashboard   : 8761   (http://localhost:8761)
+user-service       : 8081
+product-service    : 8082
+cart-service       : 8083
+order-service      : 8084
+payment-service    : 8085
+notification-svc   : 8086
+search-service     : 8087
+recommendation-svc : 8088
+admin-service      : 8089
+PostgreSQL         : 5432
+Redis              : 6379
+Kafka              : 9092
+Elasticsearch      : 9200
+```
+
+### Developer Workflows — Frontend
+
+```bash
+# ── Next.js web app ─────────────────────────────────────────
+cd frontend
+cp .env.local.example .env.local          # fill in STRIPE key, NEXTAUTH_SECRET
+npm install
+npm run dev                               # http://localhost:3000
+
+# ── Mobile (Expo) ────────────────────────────────────────────
+cd mobile
+npm install
+npx expo start                            # QR code for Expo Go
+npx expo start --ios                      # iOS simulator
+npx expo start --android                  # Android emulator
+
+# ── Run everything together ──────────────────────────────────
+# In repo root:
+cp .env.example .env                      # fill in all secrets
+docker-compose up -d                      # backend + frontend container
+# Access: http://localhost:3000 (web), http://localhost:8080 (API)
+
+# ── Add a new frontend page ──────────────────────────────────
+# 1. Create app/(store)/new-page/page.tsx
+# 2. Add API call in lib/api.ts if needed
+# 3. Add types to shared/types/index.ts
+# 4. Add mobile equivalent in mobile/app/new-page.tsx
+
+# ── Type checking ────────────────────────────────────────────
+cd frontend && npm run type-check
+```
+
+### Environment Variables — Frontend
+
+```bash
+# frontend/.env.local
+NEXT_PUBLIC_API_URL=http://localhost:8080     # Spring Cloud Gateway
+NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_test_  # Stripe public key (safe to expose)
+NEXTAUTH_URL=http://localhost:3000
+NEXTAUTH_SECRET=<random-32-char-string>
+
+# In Docker (docker-compose.yml frontend service):
+NEXT_PUBLIC_API_URL=http://api-gateway:8080   # internal docker network name
+```
+
+### Checkout Flow — Frontend Detail
+
+```
+User clicks "Proceed to Checkout"
+  │
+  ├─ Step 1: Address
+  │    GET /api/users/addresses  → list saved addresses
+  │    User selects one → selectedAddressId stored in component state
+  │
+  ├─ Step 2: Payment
+  │    In production: render <Stripe Elements> CardElement
+  │    stripe.createPaymentMethod() → paymentMethodId (pm_...)
+  │    In dev/test: manually paste a Stripe test token
+  │
+  ├─ Step 3: Review + Place Order
+  │    POST /api/orders/checkout  { idempotencyKey, shippingAddressId, paymentMethodId }
+  │    → order-service creates Order (status: CREATED)
+  │    → publishes ORDER_CREATED to Kafka
+  │
+  │    POST /api/payments/process { orderId, paymentMethodId }
+  │    → payment-service calls Stripe API
+  │    → Stripe webhook fires → POST /api/payments/webhook
+  │    → PaymentEvent published to Kafka
+  │
+  └─ Order status updates via:
+       • Web: useQuery refetchInterval: 30_000 on /orders/[id]
+       • Mobile: same refetchInterval on orders/[id].tsx
+```
 
 *Generated from codebase analysis — update this file when adding services, topics, or infrastructure components.*
